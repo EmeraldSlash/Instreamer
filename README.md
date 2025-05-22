@@ -1,6 +1,6 @@
 # Instreamer
 
-This is a library for doing per-player instance streaming in Roblox. In the library's nomenclature, instances are called "assets".
+This is a library for doing per-player instance streaming in Roblox, allowing instances to be used with the same level of convenience as Roblox's built-in assets (such as images, sounds, and animations). Due to this similarity this library refers to such instances as "assets".
 
 For reading the code, I recommend a tab width of 3 since that's what I wrote it with (and my Luau formatting style depends on tab width). Unfortunately GitHub does not provide this tab width as a selectable option, but you can get it for a particular file by appending `?ts=3` to the end of the file's URL.
 
