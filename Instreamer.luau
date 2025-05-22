@@ -1,6 +1,6 @@
 --!strict
 
--- Instreamer: Player-specific instance streaming.
+-- Instreamer: Per-player instance streaming.
 --
 -- https://github.com/EmeraldSlash/Instreamer
 --
