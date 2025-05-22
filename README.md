@@ -8,6 +8,7 @@ At the moment, this library provides:
 - A client-initiated subscription approach to streaming instances
 - Client-side immediate-mode and retained-mode APIs for streaming instances
 - Server-side utilities for sending instances to players via PlayerGui
+- Lots of flexibility: assets are identified by strings, and the server can respond with anything it likes including generating instances on the fly.
 
 Future plans:
 - Confirm whether instances replicate atomically through PlayerGui or not. (They appear to be atomic in my experience so far.)
