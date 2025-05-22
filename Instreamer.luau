@@ -629,6 +629,8 @@ end
 function Module.SC_Subscribe(SC: StreamerClient, Id: string, Key: any): AssetHandle
 	if PRF_ON then debug.profilebegin("Instreamer_SC_Subscribe") end
 	
+	assert(Key ~= nil, "[Instreamer] Cannot subscribe to an asset without a key.")
+	
 	if not SC.Handle_ById[Id] then
 		local Handle = {} :: DLL_Node<AssetHandle>
 		SC.Handle_ById[Id] = Handle
@@ -643,14 +645,7 @@ function Module.SC_Subscribe(SC: StreamerClient, Id: string, Key: any): AssetHan
 	end
 	
 	local Handle = SC.Handle_ById[Id]
-	do
-		local Retained = Handle.Retained
-		if not Retained then
-			Handle.Retained = {Key}
-		elseif not table.find(Retained, Key) then
-			Retained[#Retained+1] = Key
-		end
-	end
+	Handle.Retained = WeakArrayAppendOnce(Handle.Retained, Key)
 	if DLL_IsInside(SC.DLL_Cache, Handle) then
 		DLL_Remove(Handle)
 	end
@@ -665,6 +660,9 @@ function Module.SC_Unsubscribe(SC: StreamerClient, Id: string, Key: any, Now: nu
 	local Handle = SC.Handle_ById[Id]
 	if Handle then
 		
+		-- WeakArrayDelete is manually written here because we need to guard
+		-- the destructor code and it's not worth the extra complexity to make
+		-- the function support that.
 		local Retained = Handle.Retained
 		if Retained then
 			local Index = table.find(Retained, Key)
