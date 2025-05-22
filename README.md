@@ -10,7 +10,7 @@ At the moment, this library provides:
 - Server-side utilities for sending instances to players via PlayerGui
 
 Future plans:
-- Confirm whether assets replicate atomically through PlayerGui or not. (They appear to be atomic in my experience so far.)
+- Confirm whether instances replicate atomically through PlayerGui or not. (They appear to be atomic in my experience so far.)
 - Immediate-mode and retained-mode APIs to allow the server to decide to globally replicate assets to all players while keeping the same client-side API.
 - Maybe: Out-of-the-box implementations or helpers for server-side asset databases, subscription request validation, and top-level asset replication to players.
 - Maybe: Allowances for different expiry timings/conditions for cached assets client-side.
