@@ -6,23 +6,32 @@
 --
 -- Created by Rio Manson-Hay (@EmeraldSlash)
 --
--- Version: 1 (2025-05-22)
+-- Version: 2 (2025-06-05)
 --
 -- Change Log:
 --
 -- Version 1: Initial version.
+--
+-- Version 2: Added High-Level API, and categorized the Low-Level API and Helper
+-- API.
 
----
--- Shared API Summary:
+--
+-- HELPER API:
+-- "These are generic helpers for everyone using the module."
 --
 -- .IdFromStrings(): string
 -- .StringsFromId(): {string}
+
+-- LOW-LEVEL API (LAPI):
+-- "This is an API for developers who want more control."
+--
+-- Shared:
+--
 -- .RequestId: enum
 -- type AssetRequest
--- type AssetResponse
-
+-- type AssetResponse 
 --
--- Server API Summary:
+-- Server:
 --
 -- .MakeAssetResponse(): AssetResponse
 -- type Replicator
@@ -31,9 +40,8 @@
 -- .AS_Create(): AssetSender
 -- .AS_Send()
 -- .AS_Finish()
-
 --
--- Client API Summary:
+-- Client:
 --
 -- type AssetHandle
 -- type AssetIncomplete
@@ -48,9 +56,27 @@
 -- .SC_ReceiveAssets()
 -- .SC_CheckAssets()
 -- .SC_CleanupAssets()
--- .SC_Use(): Instance?
--- .SC_Subscribe(): AssetHandle
--- .SC_Unsubscribe()
+-- .SC_Use(): Instance?             (immediate-mode)
+-- .SC_Subscribe(): AssetHandle     (retained-mode)
+-- .SC_Unsubscribe()                (retained-mode)
+
+--
+-- HIGH-LEVEL API (HAPI):
+-- "This is an easy-to-use API for developers who don't need much control."
+--
+-- Server:
+--
+-- Module.ServerInit(GetAssetCallback)
+--
+-- Client:
+--
+-- Module.ClientInit(): StreamerClient
+-- Module.ClientUse(): Instance?          (immediate-mode)
+-- Module.ClientSubscribe(Id): ClientSub  (retained-mode)
+-- ClientSub:Unsubscribe(): ClientSub
+-- ClientSub:GetNow(): Instance?
+-- ClientSub:GetAsync(): Instance?
+-- ClientSub:SetLoadedCallback(AssetLoadedCallback?): ClientSub
 
 local Module = {}
 
@@ -62,6 +88,21 @@ local PRF_ON = false
 --
 
 -- Doubly Linked List
+--
+-- Here is the idiomatic & most efficient way to walk the linked list:
+--[[
+local DLL_Current = DLL_Sentinel.DLL_Next
+while DLL_Current ~= DLL_Sentinel do
+	local Element = DLL_Current
+	DLL_Current = DLL_Current.DLL_Next
+	
+	-- It is safe to remove elements after the Current pointer has been moved to 
+	-- the next node.
+	DLL_Remove(Element)
+	
+	-- Do other stuff with Element here.
+end
+--]]
 type DLL_Node<T> = T & {
 	DLL_Sentinel: DLL_Node<T>;
 	DLL_Next: DLL_Node<T>;
@@ -140,7 +181,7 @@ local function WeakArrayDelete<T>(Array: {T}?, Value: T): {T}?
 end
 
 --
--- Shared API
+-- HELPER API
 --
 
 function Module.IdFromStrings(Strings: {string})
@@ -149,6 +190,14 @@ end
 function Module.StringsFromId(Id: string): {string}
 	return string.split(Id, ";")
 end
+
+--
+-- LOW-LEVEL API (LAPI)
+--
+
+--
+-- LAPI Shared
+--
 
 Module.RequestId = {
 	subscribe = "s";
@@ -163,7 +212,7 @@ export type AssetResponse = {
 }
 
 --
--- Server API
+-- LAPI Server
 --
 
 -- To send assets to a client, do these steps:
@@ -173,41 +222,6 @@ export type AssetResponse = {
 --
 -- This API provides some helpers for this work. They are marked by the step
 -- they are relevant to.
---
--- Some example usage code of this API:
---[[
-
-local AssetDatabase = {
-	Frog = game.ServerStorage.Frog;
-}
-
-local Replicator_ByPlayer = {}
-Players.PlayerAdded:Connect(function(Player)
-	Replicator_ByPlayer[Player] = Instreamer.CreateReplicator(Player)
-end)
-
-RunService.Heartbeat:Connect(function()
-	local AssetSender = Instreamer.AS_Create()
-	for _, Player in Players:GetPlayers() do
-		local Replicator = Replicator_ByPlayer[Player]
-		
-		local SentAssets = {}
-		for _, AssetId in AssetIdsToSend_ByPlayer[Player] do
-			local AssetInstance = AssetDatabase[AssetId]
-			
-			Instreamer.AS_Send(AssetSender, Replicator, AssetInstance)
-			SentAssets[#SentAssets+1] = Instreamer.MakeResponse(AssetId, AssetInstance)
-		end
-		table.clear(AssetIdsToSend_ByPlayer[Player])
-		
-		if SentAssets[1] then
-			RemoteEvent:FireClient(Player, SentAssets)
-		end
-	end
-	Instreamer.AS_Finish(AssetSender)
-end)
-
---]]
 
 -- (Step 2) A RemoteEvent should be fired to the client while the instance is 
 -- parented under their PlayerGui. This function .MakeAssetResponse() can be 
@@ -287,7 +301,7 @@ function Module.AS_Finish(AS: AssetSender)
 end
 
 --
--- Client API
+-- LAPI Client
 --
 
 export type AssetHandle = {
@@ -631,7 +645,9 @@ function Module.SC_Subscribe(SC: StreamerClient, Id: string, Key: any): AssetHan
 	
 	assert(Key ~= nil, "[Instreamer] Cannot subscribe to an asset without a key.")
 	
-	if not SC.Handle_ById[Id] then
+	if SC.Handle_ById[Id] then
+		warn(debug.traceback(("[Instreamer] Asset \"%s\" already has a subscription with key: %s. To avoid aliasing you should use a different key for every subscription."):format(Id, tostring(Key))))
+	else
 		local Handle = {} :: DLL_Node<AssetHandle>
 		SC.Handle_ById[Id] = Handle
 		Handle.Id = Id
@@ -682,6 +698,303 @@ function Module.SC_Unsubscribe(SC: StreamerClient, Id: string, Key: any, Now: nu
 	end
 	
 	if PRF_ON then debug.profileend() end	
+end
+
+--
+-- HIGH-LEVEL API (HAPI)
+--
+
+--
+-- HAPI Server
+--
+
+local RunService = game:GetService("RunService")
+
+export type ServerAssetGetter = (Player: Player, AssetId: string)->(Instance?)
+
+do
+	type PlayerState = {
+		Replicator: Replicator;
+		PendingAssetRequests: {AssetRequest};
+		Subscribed_ByAssetId: {[string]: boolean};
+	}
+	
+	local State = (function() return { -- Function to seal table type.
+ 
+		Initialized = false;
+		PS_ByPlayer = {} :: {[Player]: PlayerState};
+
+	} end)()
+	
+	-- You must call this server-side to get things up and running. The 
+	-- GetAssetCallback function must be provided, which is responsible for 
+	-- looking up an instance that is able to be replicated to a particular 
+	-- player. For example, the callback could look up the asset in a hash table,
+	-- and check whether the player is allowed to receive the asset. The 
+	-- callback should return nil if an asset does not exist or the player is not
+	-- allowed to receive it.
+	function Module.ServerInit(GetAssetCallback: ServerAssetGetter)
+		if not State.Initialized then
+			State.Initialized = true
+			
+			local Players = game:GetService("Players")
+			Players.PlayerAdded:Connect(function(Player: Player)
+				local PS = {} :: PlayerState
+				PS.Replicator = Module.CreateReplicator(Player)
+				PS.PendingAssetRequests = {}
+				PS.Subscribed_ByAssetId = {}
+				State.PS_ByPlayer[Player] = PS
+			end)
+			Players.PlayerRemoving:Connect(function(Player: Player)
+				local PS = State.PS_ByPlayer[Player]
+				if PS then
+					State.PS_ByPlayer[Player] = nil
+					PS.Replicator:Destroy()
+				end
+			end)
+			
+			local RemoteEvent = Instance.new("RemoteEvent")
+			RemoteEvent.Name = "InstreamerRemote"
+			RemoteEvent.Parent = script
+			RemoteEvent.OnServerEvent:Connect(function(
+				Player: Player,
+				Requests: {AssetRequest}
+			)
+				local PS = State.PS_ByPlayer[Player]
+				if PS then
+					for _, Request in Requests do
+						PS.PendingAssetRequests[#PS.PendingAssetRequests+1] = Request
+					end
+				end
+			end)
+
+			RunService.Heartbeat:Connect(function()
+				if PRF_ON then debug.profilebegin("InstreamerServerHbt") end
+				
+				local AssetSender = Module.AS_Create()
+				
+				for Player, PS in State.PS_ByPlayer do
+					
+					-- Process all requests in a first pass to avoid duplication of
+					-- asset getter & replication work.
+					local Subscribed_ByAssetId = {}
+					for _, Request in PS.PendingAssetRequests do
+						local AssetId = Request[2]
+						if type(AssetId) == "string" then
+							local RequestId = Request[1]
+							if RequestId == Module.RequestId.unsubscribe then
+								Subscribed_ByAssetId[AssetId] = false
+							elseif RequestId == Module.RequestId.subscribe then
+								Subscribed_ByAssetId[AssetId] = true
+							end
+						end
+					end
+					table.clear(PS.PendingAssetRequests)
+					
+					-- Second pass to apply the subscription state changes and
+					-- replicate assets.
+					local SentAssets = {}
+					for AssetId, NewSubscribed in Subscribed_ByAssetId do
+						if not NewSubscribed then
+							PS.Subscribed_ByAssetId[AssetId] = nil
+							
+						elseif not PS.Subscribed_ByAssetId[AssetId] then
+							local AssetInstance = GetAssetCallback(Player, AssetId)
+							if not AssetInstance then
+								PS.Subscribed_ByAssetId[AssetId] = nil
+							else
+								PS.Subscribed_ByAssetId[AssetId] = true
+								
+								Module.AS_Send(AssetSender, PS.Replicator, AssetInstance)
+								SentAssets[#SentAssets+1] =
+									Module.MakeAssetResponse(AssetId, AssetInstance)
+							end
+						end
+					end
+					if SentAssets[1] then
+						RemoteEvent:FireClient(Player, SentAssets)
+					end
+				end
+				
+				Module.AS_Finish(AssetSender)
+				
+				if PRF_ON then debug.profileend() end
+			end)
+		end
+	end
+end
+
+--
+-- HAPI Client
+--
+
+do
+	local State = (function() return { -- Function to seal table type.
+		
+		Initializing = false;
+		SC = (nil :: any) :: StreamerClient; -- Initialized later.
+		PendingResponses = {} :: {AssetResponse};
+		
+	} end)()
+	
+	local IsClient = RunService:IsClient()
+	local function RequireClient()
+		if not IsClient then
+			error("Instreamer.Client* functions can only be used on the client!")
+		end
+	end
+	
+	local function ClientInitInternal()
+		if not State.Initializing then
+			State.Initializing = true
+			
+			-- This must be set immediately so it can be accessed by usage code. 
+			State.SC = Module.SC_Create()
+			
+			-- All the setup work which may yield is done in here, transparently to
+			-- the usage code. Usage code will never experience a yield and 
+			-- shouldn't need to care about timing stuff.
+			task.spawn(function()
+				
+				local RemoteEvent = script:WaitForChild("InstreamerRemote") :: Instance
+				assert(RemoteEvent:IsA("RemoteEvent"), "InstreamerRemote was not a RemoteEvent!")
+				RemoteEvent.OnClientEvent:Connect(function(Responses)
+					table.move(
+						Responses, 1, #Responses,
+						#State.PendingResponses+1, State.PendingResponses)
+				end)
+				
+				RunService.Heartbeat:Connect(function()
+					if PRF_ON then debug.profilebegin("InstreamerClientHbt") end
+					
+					Module.SC_ReceiveAssets(State.SC, State.PendingResponses)
+					table.clear(State.PendingResponses)
+					
+					Module.SC_CheckAssets(State.SC)
+					Module.SC_CleanupAssets(State.SC, os.clock())
+					
+					local Requests = State.SC.PendingRequests
+					if Requests[1] then
+						RemoteEvent:FireServer(Requests)
+						table.clear(Requests)
+					end
+					
+					if PRF_ON then debug.profileend() end
+				end)
+			end)
+		end
+	end
+	
+	export type ClientSub = {
+		Handle: AssetHandle;
+		Key: any;
+		Threads: {thread};
+		GetAsyncCallback: AssetLoadedCallback?;
+		LoadedCallback: AssetLoadedCallback?;
+		
+		Unsubscribe: (ClientSub)->();
+		GetNow: (ClientSub)->();
+		GetAsync: (ClientSub)->();
+		SetLoadedCallback: (ClientSub, AssetLoadedCallback)->();
+	}
+	local function CS_Unsubscribe(CS: ClientSub): ClientSub
+		Module.SC_Unsubscribe(State.SC, CS.Handle.Id, CS.Key, os.clock())
+		
+		if CS.LoadedCallback then
+			Module.AH_RemoveCallback(CS.Handle, CS.LoadedCallback)
+			CS.LoadedCallback = nil
+		end
+		if CS.GetAsyncCallback then
+			Module.AH_RemoveCallback(CS.Handle, CS.GetAsyncCallback)
+		end
+		
+		local Threads = CS.Threads
+		table.clear(CS.Threads)
+		for _, Thread in Threads do
+			task.spawn(Thread, nil, CS.Handle, State.SC)
+		end
+		
+		return CS
+	end
+	local function CS_GetNow(CS: ClientSub): Instance?
+		return CS.Handle.Asset
+	end
+	local function CS_GetAsync(CS: ClientSub): Instance?
+		if not CS.Handle.Asset then
+			
+			if not CS.GetAsyncCallback then
+				CS.GetAsyncCallback = function(...)
+					local Threads = CS.Threads
+					table.clear(CS.Threads)
+					for _, Thread in Threads do
+						task.spawn(Thread, ...)
+					end
+				end
+				Module.AH_AddCallback(CS.Handle, CS.GetAsyncCallback :: any)
+			end
+			
+			CS.Threads[#CS.Threads+1] = coroutine.running()
+			coroutine.yield()
+		end
+		return CS.Handle.Asset
+	end
+	local function CS_SetLoadedCallback(CS: ClientSub, Callback: AssetLoadedCallback?): ClientSub
+		if CS.LoadedCallback then
+			Module.AH_RemoveCallback(CS.Handle, CS.LoadedCallback)
+			CS.LoadedCallback = nil
+		end
+		if Callback then
+			CS.LoadedCallback = Callback
+			Module.AH_AddCallback(CS.Handle, Callback)
+		end
+		return CS
+	end
+	
+	-- You can call this after requiring the module to get things up and running,
+	-- but it will be called automatically when other functions are called so 
+	-- that is optional. You can call this function as many times as you like. It
+	-- will return the StreamerClient when called, so you can use it to get 
+	-- access to the LAPI if you wish.
+	function Module.ClientInit(): StreamerClient
+		RequireClient()
+		ClientInitInternal()
+		return State.SC
+	end
+	
+	-- Call this every frame that you want to use an asset or have it be loaded.
+	-- If the asset is available at the time of the call it will be returned.
+	function Module.ClientUse(Id: string): Instance?
+		RequireClient()
+		ClientInitInternal()
+		
+		return Module.SC_Use(State.SC, Id)
+	end
+	
+	-- Call this when you want to subscribe to some asset. Optionally provide a 
+	-- key to identify this subscription, otherwise the ClientSub table will be 
+	-- used. Returns a ClientSub table which has facilities to retrieve the asset
+	-- or unsubscribe from it.
+	function Module.ClientSubscribe(Id: string, Key: any?): ClientSub
+		RequireClient()
+		ClientInitInternal()
+		
+		local CS: ClientSub = {
+			Handle = nil :: any;
+			Key = nil :: any;
+			Threads = {};
+			
+			Unsubscribe = CS_Unsubscribe;
+			GetNow = CS_GetNow;
+			GetAsync = CS_GetAsync;
+			SetLoadedCallback = CS_SetLoadedCallback;
+		}
+		
+		local RealKey = if Key ~= nil then Key else CS
+		CS.Key = RealKey
+		CS.Handle = Module.SC_Subscribe(State.SC, Id, CS.Key)
+		
+		return CS
+	end
 end
 
 return Module
