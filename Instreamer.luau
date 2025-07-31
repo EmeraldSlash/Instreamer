@@ -1075,6 +1075,9 @@ do
 	-- It will also return the StreamerClient when called, so you can use it to
 	-- get access to the LAPI if you wish.
 	--
+	-- You do not need to call this function if you are only using the HAPI with
+	-- StreamerClients created by your own code.
+	--
 	function Module.ClientInit(): StreamerClient
 		RequireClient()
 		ClientInitInternal()
@@ -1093,7 +1096,7 @@ do
 	--
 	function Module.ClientUse(Id: string, SC: StreamerClient?): Instance?
 		RequireClient()
-		ClientInitInternal()
+		if not SC then ClientInitInternal() end
 
 		return Module.SC_Use(SC or State.SC, Id)
 	end
@@ -1112,7 +1115,7 @@ do
 	--
 	function Module.ClientSubscribe(Id: string, Key: any?, SC: StreamerClient?): ClientSub
 		RequireClient()
-		ClientInitInternal()
+		if not SC then ClientInitInternal() end
 
 		local CS: ClientSub = {
 			Handle = nil :: any;
