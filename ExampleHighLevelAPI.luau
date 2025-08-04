@@ -30,7 +30,7 @@ game:GetService("RunService").Heartbeat:Connect(function()
 		table.clear(Walls)
 	else
 		local WallTemplate = Instreamer.ClientUse("Wall")
-		if not Walls[1] then
+		if WallTemplate and not Walls[1] then
 			for Index = 1, 4 do
 				local Wall = WallTemplate:Clone()
 				Wall.Parent = workspace
