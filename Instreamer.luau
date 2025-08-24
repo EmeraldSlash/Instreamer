@@ -6,7 +6,7 @@
 --
 -- Created by Rio Manson-Hay (@EmeraldSlash)
 --
--- Version: 3 (2025-08-01)
+-- Version: 4 (2025-08-24)
 --
 -- Change Log:
 --
@@ -16,6 +16,9 @@
 -- API.
 --
 -- Version 3: Improved High-Level API and fixed some small bugs.
+--
+-- Version 4: Added .ClientSetLogFunction()
+--
 
 --------------------------------------------------------------------------------
 
@@ -42,6 +45,7 @@
 -- Module.ClientInit(): StreamerClient
 -- Module.ClientUse(): Instance?        (immediate-mode)
 -- Module.ClientSubscribe(): ClientSub  (retained-mode)
+-- Module.ClientSetLogFunction(LogFunction)
 --
 -- type ClientSub
 -- type ClientSubLoadedCallback
@@ -1133,6 +1137,16 @@ do
 		CS.Handle = Module.SC_Subscribe(SC or State.SC, Id, CS.Key)
 		
 		return CS
+	end
+
+	-- Module.ClientSetLogFunction()
+	--
+	-- Set the function used to log streaming behavior.
+	--
+  	function Module.ClientSetLogFunction(LogFunction: ((string)->())?)
+		RequireClient()
+		ClientInitInternal()
+		State.SC.LogFunction = LogFunction
 	end
 end
 
