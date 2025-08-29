@@ -6,7 +6,7 @@
 --
 -- Created by Rio Manson-Hay (@EmeraldSlash)
 --
--- Version: 4 (2025-08-24)
+-- Version: 5 (2025-08-29)
 --
 -- Change Log:
 --
@@ -18,6 +18,8 @@
 -- Version 3: Improved High-Level API and fixed some small bugs.
 --
 -- Version 4: Added .ClientSetLogFunction()
+--
+-- Version 5: Added ClientSub:OnLoadedOnce()
 --
 
 --------------------------------------------------------------------------------
@@ -53,6 +55,7 @@
 -- ClientSub:GetNow(): Instance?
 -- ClientSub:GetAsync(): Instance?
 -- ClientSub:OnLoaded(ClientSubLoadedCallback): ClientSubConnection
+-- ClientSub:OnLoadedOnce(ClientSubLoadedCallback): ClientSubConnection
 --
 -- type ClientSubConnection
 -- ClientSubConnection:Disconnect/Destroy()
@@ -943,6 +946,7 @@ do
 		GetNow: (ClientSub)->();
 		GetAsync: (ClientSub)->();
 		OnLoaded: (ClientSub, ClientSubLoadedCallback)->(ClientSubConnection);
+		OnLoadedOnce: (ClientSub, ClientSubLoadedCallback)->(ClientSubConnection);
 	}
 	export type ClientSubConnection = {
 		-- Internal fields
@@ -1070,6 +1074,17 @@ do
 		return Conn
 	end
 
+	-- ClientSub:OnLoadedOnce()
+	--
+	-- Same as ClientSub:OnLoaded(), but will only ever run once.
+	--
+	local function CS_OnLoadedOnce(CS: ClientSub, Callback: ClientSubLoadedCallback): ClientSubConnection
+		return CS_OnLoaded(CS, Callback, function(Asset, CS, Conn)
+			Conn:Disconnect()
+			Callback(Asset, CS, Conn)
+		end)
+	end
+
 	-- Module.ClientInit()
 	--
 	-- You can call this after requiring the module to get things up and running,
@@ -1130,6 +1145,7 @@ do
 			GetNow = CS_GetNow;
 			GetAsync = CS_GetAsync;
 			OnLoaded = CS_OnLoaded;
+			OnLoadedOnce = CS_OnLoadedOnce;
 		}
 
 		local RealKey = if Key ~= nil then Key else CS
