@@ -10,16 +10,25 @@
 --
 -- Change Log:
 --
--- Version 1: Initial version.
+-- Version 1:
+-- >> Initial version.
 --
--- Version 2: Added High-Level API, and categorized the Low-Level API and Helper
--- API.
+-- Version 2:
+-- >> Added High-Level API, and categorized the Low-Level API and Helper API.
 --
--- Version 3: Improved High-Level API and fixed some small bugs.
+-- Version 3:
+-- >> Improved High-Level API and fixed some small bugs.
 --
--- Version 4: Added .ClientSetLogFunction()
+-- Version 4:
+-- >> Added .ClientSetLogFunction()
 --
--- Version 5: Added ClientSub:OnLoadedOnce()
+-- Version 5:
+-- >> Fixed a bug where .SC_Subscribe() and .SC_Unsubscribe() would not handle
+-- the Key parameter properly.
+-- >> Added ClientSub:OnLoadedOnce() and ClientSub:Destroy() methods
+-- >> Made ClientSub:OnLoaded...() callbacks execute using task.defer()
+-- >> Made ClientSub:OnLoaded...() callbacks execute when the desired asset
+-- is already loaded at the time the method is called.
 --
 
 --------------------------------------------------------------------------------
@@ -51,7 +60,7 @@
 --
 -- type ClientSub
 -- type ClientSubLoadedCallback
--- ClientSub:Unsubscribe(): ClientSub
+-- ClientSub:Unsubscribe/Destroy(): ClientSub
 -- ClientSub:GetNow(): Instance?
 -- ClientSub:GetAsync(): Instance?
 -- ClientSub:OnLoaded(ClientSubLoadedCallback): ClientSubConnection
@@ -686,9 +695,7 @@ function Module.SC_Subscribe(SC: StreamerClient, Id: string, Key: any): AssetHan
 
 	assert(Key ~= nil, "[Instreamer] Cannot subscribe to an asset without a key.")
 
-	if SC.Handle_ById[Id] then
-		warn(debug.traceback(("[Instreamer] Asset \"%s\" already has a subscription with key: %s. To avoid aliasing you should use a different key for every subscription."):format(Id, tostring(Key))))
-	else
+	if not SC.Handle_ById[Id] then
 		local Handle = {} :: DLL_Node<AssetHandle>
 		SC.Handle_ById[Id] = Handle
 		Handle.Id = Id
@@ -702,7 +709,14 @@ function Module.SC_Subscribe(SC: StreamerClient, Id: string, Key: any): AssetHan
 	end
 
 	local Handle = SC.Handle_ById[Id]
-	Handle.Retained = WeakArrayAppendOnce(Handle.Retained, Key)
+	if not Handle.Retained then
+		Handle.Retained = {Key}
+	elseif table.find(Handle.Retained, Key) then
+		warn(debug.traceback(("[Instreamer] Asset \"%s\" already has a subscription with key: %s. To avoid aliasing you should use a different key for every subscription.")
+			:format(Id, tostring(Key))))
+	else
+		Handle.Retained[#Handle.Retained+1] = Key
+	end
 	if DLL_IsInside(SC.DLL_Cache, Handle) then
 		DLL_Remove(Handle)
 	end
@@ -724,7 +738,7 @@ function Module.SC_Unsubscribe(SC: StreamerClient, Id: string, Key: any, Now: nu
 		if Retained then
 			local Index = table.find(Retained, Key)
 			if Index then
-				table.remove(Retained, Key)
+				table.remove(Retained, Index)
 				if not Retained[1] then
 					Handle.Retained = nil
 
@@ -943,6 +957,7 @@ do
 
 		-- Exposed methods
 		Unsubscribe: (ClientSub)->();
+		Destroy: (ClientSub)->();
 		GetNow: (ClientSub)->();
 		GetAsync: (ClientSub)->();
 		OnLoaded: (ClientSub, ClientSubLoadedCallback)->(ClientSubConnection);
@@ -975,6 +990,7 @@ do
 	end
 
 	-- ClientSub:Unsubscribe()
+	-- ClientSub:Destroy()
 	--
 	-- Unsubscribes from the asset. This will resume any waiting GetAsync() or
 	-- other threads.
@@ -1044,6 +1060,11 @@ do
 	-- so that the callback is executed whenever a new version of the asset has
 	-- loaded. Returns a Connection object that you can Disconnect/Destroy.
 	--
+	-- If the asset is already loaded then the callback will be executed. The
+	-- callback will always be executed using task.defer(), however it is
+	-- guaranteed that your code will never run after the connection is
+	-- disconnected, so you don't need to worry about that.
+	--
 	-- The callback may execute more than once per binding if the asset gets sent
 	-- to the client twice, so if you only want it to be called once you should
 	-- disconnect the connection immediately within the callback (the connection
@@ -1054,8 +1075,12 @@ do
 		if not CS.LoadedCallback then
 			CS.LoadedCallback = function(Asset)
 				if Asset and CS.LoadedConnections then
-					for _, Conn in table.clone(CS.LoadedConnections) do
-						Conn.Callback(Asset, CS, Conn)
+					for _, Conn in CS.LoadedConnections do
+						task.defer(function()
+							if Conn.Connected then
+								Conn.Callback(Asset, CS, Conn)
+							end
+						end)
 					end
 				end
 			end
@@ -1071,6 +1096,9 @@ do
 			Disconnect = CSC_Destroy;
 		}
 		CS.LoadedConnections = WeakArrayAppendOnce(CS.LoadedConnections, Conn)
+		if CS.Handle.Asset then
+			task.spawn(Callback, CS.Handle.Asset, CS, Conn)
+		end
 		return Conn
 	end
 
@@ -1142,6 +1170,7 @@ do
 			Threads = {};
 
 			Unsubscribe = CS_Unsubscribe;
+			Destroy = CS_Unsubscribe;
 			GetNow = CS_GetNow;
 			GetAsync = CS_GetAsync;
 			OnLoaded = CS_OnLoaded;
