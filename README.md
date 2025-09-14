@@ -9,12 +9,12 @@ At the moment, this library provides:
 - Client-side immediate-mode and retained-mode APIs for streaming instances
 - Server-side utilities for sending instances to players via PlayerGui
 - Lots of flexibility:
-   - Assets are identified by strings, with an optional convention for handling different asset types that may share names
+   - Assets are identified by strings, with an optional convention for namespacing different asset types
    - The server can respond with anything it likes to any player including generating instances on the fly
    - High-level API for developers who just want plug & play asset streaming
    - Low-level API for developers who want a bit more control over things like code execution
 
 Future plans:
 - Confirm whether instances replicate atomically through PlayerGui or not. (They appear to be atomic in my experience so far.)
-- Immediate-mode and retained-mode APIs to allow the server to decide to globally replicate assets to all players while keeping the same client-side API.
+- Immediate-mode and retained-mode APIs to allow the server to decide to globally/specifically replicate assets to players while keeping the same client-side API.
 - Maybe: Allowances for different expiry timings/conditions for cached assets client-side.
