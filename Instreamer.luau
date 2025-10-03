@@ -6,7 +6,7 @@
 --
 -- Created by Rio Manson-Hay (@EmeraldSlash)
 --
--- Version: 5 (2025-08-29)
+-- Version: 6 (2025-10-03)
 --
 -- Change Log:
 --
@@ -29,6 +29,10 @@
 -- >> Made ClientSub:OnLoaded...() callbacks execute using task.defer()
 -- >> Made ClientSub:OnLoaded...() callbacks execute when the desired asset
 -- is already loaded at the time the method is called.
+--
+-- Version 6:
+-- >> Fixed types related to ClientSub not being exported properly.
+-- >> Fixed type signature for ClientSub:GetAsync() and ClientSub:GetNow().
 --
 
 --------------------------------------------------------------------------------
@@ -57,6 +61,7 @@
 -- Module.ClientUse(): Instance?        (immediate-mode)
 -- Module.ClientSubscribe(): ClientSub  (retained-mode)
 -- Module.ClientSetLogFunction(LogFunction)
+-- type LogFunction = (String: string)->()
 --
 -- type ClientSub
 -- type ClientSubLoadedCallback
@@ -65,6 +70,12 @@
 -- ClientSub:GetAsync(): Instance?
 -- ClientSub:OnLoaded(ClientSubLoadedCallback): ClientSubConnection
 -- ClientSub:OnLoadedOnce(ClientSubLoadedCallback): ClientSubConnection
+--
+-- type ClientSubLoadedCallback = (
+-- 	Asset: Instance,
+-- 	ClientSub: ClientSub,
+-- 	ClientSubConnection: ClientSubConnection
+-- )->()
 --
 -- type ClientSubConnection
 -- ClientSubConnection:Disconnect/Destroy()
@@ -889,6 +900,37 @@ end
 -- HAPI Client
 --
 
+export type ClientSub = {
+	-- Internal fields
+	Handle: AssetHandle;
+	Key: any;
+	Threads: {thread};
+	GetAsyncCallback: AssetLoadedCallback?;
+	LoadedCallback: AssetLoadedCallback?;
+	LoadedConnections: {ClientSubConnection}?;
+
+	-- Exposed methods
+	Unsubscribe: (ClientSub)->();
+	Destroy: (ClientSub)->();
+	GetNow: (ClientSub)->(Instance?);
+	GetAsync: (ClientSub)->(Instance?);
+	OnLoaded: (ClientSub, ClientSubLoadedCallback)->(ClientSubConnection);
+	OnLoadedOnce: (ClientSub, ClientSubLoadedCallback)->(ClientSubConnection);
+}
+export type ClientSubConnection = {
+	-- Internal fields
+	CS: ClientSub;
+	Callback: ClientSubLoadedCallback;
+
+	-- Exposed fields
+	Connected: boolean; -- You can read this to check if still connected.
+
+	-- Exposed methods
+	Destroy: (ClientSubConnection)->();
+	Disconnect: (ClientSubConnection)->();
+}
+export type ClientSubLoadedCallback = (Asset: Instance, CS: ClientSub, CSC: ClientSubConnection)->()
+
 do
 	local State = (function() return { -- Function to seal table type.
 
@@ -945,37 +987,6 @@ do
 			end)
 		end
 	end
-
-	export type ClientSub = {
-		-- Internal fields
-		Handle: AssetHandle;
-		Key: any;
-		Threads: {thread};
-		GetAsyncCallback: AssetLoadedCallback?;
-		LoadedCallback: AssetLoadedCallback?;
-		LoadedConnections: {ClientSubConnection}?;
-
-		-- Exposed methods
-		Unsubscribe: (ClientSub)->();
-		Destroy: (ClientSub)->();
-		GetNow: (ClientSub)->();
-		GetAsync: (ClientSub)->();
-		OnLoaded: (ClientSub, ClientSubLoadedCallback)->(ClientSubConnection);
-		OnLoadedOnce: (ClientSub, ClientSubLoadedCallback)->(ClientSubConnection);
-	}
-	export type ClientSubConnection = {
-		-- Internal fields
-		CS: ClientSub;
-		Callback: ClientSubLoadedCallback;
-
-		-- Exposed fields
-		Connected: boolean; -- You can read this to check if still connected.
-
-		-- Exposed methods
-		Destroy: (ClientSubConnection)->();
-		Disconnect: (ClientSubConnection)->();
-	}
-	export type ClientSubLoadedCallback = (Asset: Instance, CS: ClientSub, CSC: ClientSubConnection)->()
 
 	-- ClientSubConnection:Disconnect()
 	-- ClientSubConnection:Destroy()
