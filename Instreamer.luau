@@ -6,7 +6,7 @@
 --
 -- Created by Rio Manson-Hay (@EmeraldSlash)
 --
--- Version: 6 (2025-10-03)
+-- Version: 7 (2025-10-05)
 --
 -- Change Log:
 --
@@ -34,6 +34,8 @@
 -- >> Fixed types related to ClientSub not being exported properly.
 -- >> Fixed type signature for ClientSub:GetAsync() and ClientSub:GetNow().
 --
+-- Version 7:
+-- >> Fixed ClientSub:OnLoaded...() callbacks not being deferred properly.
 
 --------------------------------------------------------------------------------
 
@@ -61,10 +63,10 @@
 -- Module.ClientUse(): Instance?        (immediate-mode)
 -- Module.ClientSubscribe(): ClientSub  (retained-mode)
 -- Module.ClientSetLogFunction(LogFunction)
+--
 -- type LogFunction = (String: string)->()
 --
 -- type ClientSub
--- type ClientSubLoadedCallback
 -- ClientSub:Unsubscribe/Destroy(): ClientSub
 -- ClientSub:GetNow(): Instance?
 -- ClientSub:GetAsync(): Instance?
@@ -921,6 +923,8 @@ export type ClientSubConnection = {
 	-- Internal fields
 	CS: ClientSub;
 	Callback: ClientSubLoadedCallback;
+	PendingAsset: Instance?; -- asset waiting to be given to the deferred callback
+	PendingThread: thread?; -- deferred thread that will execute the callback
 
 	-- Exposed fields
 	Connected: boolean; -- You can read this to check if still connected.
@@ -997,6 +1001,13 @@ do
 		if CSC.Connected then
 			CSC.Connected = false
 			CSC.CS.LoadedConnections = WeakArrayDelete(CSC.CS.LoadedConnections, CSC)
+
+			local Thread = CSC.PendingThread
+			if Thread then
+				coroutine.close(Thread)
+				CSC.PendingThread = nil
+			end
+			CSC.PendingAsset = nil
 		end
 	end
 
@@ -1017,8 +1028,8 @@ do
 		end
 
 		if CS.LoadedConnections then
-			for _, Conn in CS.LoadedConnections do
-				Conn.Connected = false
+			for _, CSC in CS.LoadedConnections do
+				CSC.Connected = false
 			end
 			CS.LoadedConnections = nil
 		end
@@ -1074,7 +1085,7 @@ do
 	-- If the asset is already loaded then the callback will be executed. The
 	-- callback will always be executed using task.defer(), however it is
 	-- guaranteed that your code will never run after the connection is
-	-- disconnected, so you don't need to worry about that.
+	-- disconnected, so you don't need to worry about handling that scenario.
 	--
 	-- The callback may execute more than once per binding if the asset gets sent
 	-- to the client twice, so if you only want it to be called once you should
@@ -1082,23 +1093,30 @@ do
 	-- is provided as the third argument to the callback to make this more
 	-- convenient).
 	--
+	local function RunCallbackDeferred(CSC: ClientSubConnection)
+		--assert(CSC.Connected)
+		--assert(CSC.PendingThread)
+		local Asset = assert(CSC.PendingAsset)
+		CSC.PendingAsset = nil
+		CSC.PendingThread = nil
+		CSC.Callback(Asset, CSC.CS, CSC)
+	end
 	local function CS_OnLoaded(CS: ClientSub, Callback: ClientSubLoadedCallback): ClientSubConnection
 		if not CS.LoadedCallback then
 			CS.LoadedCallback = function(Asset)
 				if Asset and CS.LoadedConnections then
-					for _, Conn in CS.LoadedConnections do
-						task.defer(function()
-							if Conn.Connected then
-								Conn.Callback(Asset, CS, Conn)
-							end
-						end)
+					for _, CSC in CS.LoadedConnections do
+						CSC.PendingAsset = Asset
+						if not CSC.PendingThread then
+							CSC.PendingThread = task.defer(RunCallbackDeferred, CSC)
+						end
 					end
 				end
 			end
 			Module.AH_AddCallback(CS.Handle, CS.LoadedCallback :: any)
 		end
 
-		local Conn: ClientSubConnection = {
+		local CSC: ClientSubConnection = {
 			CS = CS;
 			Callback = Callback;
 			Connected = true;
@@ -1106,11 +1124,12 @@ do
 			Destroy = CSC_Destroy;
 			Disconnect = CSC_Destroy;
 		}
-		CS.LoadedConnections = WeakArrayAppendOnce(CS.LoadedConnections, Conn)
+		CS.LoadedConnections = WeakArrayAppendOnce(CS.LoadedConnections, CSC)
 		if CS.Handle.Asset then
-			task.spawn(Callback, CS.Handle.Asset, CS, Conn)
+			CSC.PendingAsset = CS.Handle.Asset
+			CSC.PendingThread = task.defer(RunCallbackDeferred, CSC)
 		end
-		return Conn
+		return CSC
 	end
 
 	-- ClientSub:OnLoadedOnce()
@@ -1118,9 +1137,9 @@ do
 	-- Same as ClientSub:OnLoaded(), but will only ever run once.
 	--
 	local function CS_OnLoadedOnce(CS: ClientSub, Callback: ClientSubLoadedCallback): ClientSubConnection
-		return CS_OnLoaded(CS, function(Asset, CS, Conn)
-			Conn:Disconnect()
-			Callback(Asset, CS, Conn)
+		return CS_OnLoaded(CS, function(Asset, CS, CSC)
+			CSC:Disconnect()
+			Callback(Asset, CS, CSC)
 		end)
 	end
 
