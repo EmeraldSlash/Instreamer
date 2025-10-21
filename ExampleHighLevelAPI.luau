@@ -50,7 +50,7 @@ type WallRecord = {
 local function CreateWall(AtCFrame)
 	local WallRecord = {}
 	WallRecord.Sub = Instreamer.ClientSubscribe("Wall")
-	WallRecord.Sub:OnLoaded(function(WallTemplate)
+	WallRecord.Sub:OnLoadedOnce(function(WallTemplate)
 		local Wall = WallTemplate:Clone()
 		Wall.Parent = workspace
 		Wall:PivotTo(AtCFrame)
