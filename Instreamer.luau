@@ -6,7 +6,7 @@
 --
 -- Created by Rio Manson-Hay (@EmeraldSlash)
 --
--- Version: 7 (2025-10-05)
+-- Version: 8 (2025-10-21)
 --
 -- Change Log:
 --
@@ -36,6 +36,10 @@
 --
 -- Version 7:
 -- >> Fixed ClientSub:OnLoaded...() callbacks not being deferred properly.
+--
+-- Version 8:
+-- >> Fixed .ServerInit() not properly tracking players who are already in the
+-- server at the time it was called.
 
 --------------------------------------------------------------------------------
 
@@ -812,13 +816,6 @@ do
 			State.Initialized = true
 
 			local Players = game:GetService("Players")
-			Players.PlayerAdded:Connect(function(Player: Player)
-				local PS = {} :: PlayerState
-				PS.Replicator = Module.CreateReplicator(Player)
-				PS.PendingAssetRequests = {}
-				PS.Subscribed_ByAssetId = {}
-				State.PS_ByPlayer[Player] = PS
-			end)
 			Players.PlayerRemoving:Connect(function(Player: Player)
 				local PS = State.PS_ByPlayer[Player]
 				if PS then
@@ -826,6 +823,17 @@ do
 					PS.Replicator:Destroy()
 				end
 			end)
+			local function PlayerAdded(Player: Player)
+				local PS = {} :: PlayerState
+				PS.Replicator = Module.CreateReplicator(Player)
+				PS.PendingAssetRequests = {}
+				PS.Subscribed_ByAssetId = {}
+				State.PS_ByPlayer[Player] = PS
+			end
+			Players.PlayerAdded:Connect(PlayerAdded)
+			for _, Player in Players:GetPlayers() do
+				PlayerAdded(Player)
+			end
 
 			local RemoteEvent = Instance.new("RemoteEvent")
 			RemoteEvent.Name = "InstreamerRemote"
