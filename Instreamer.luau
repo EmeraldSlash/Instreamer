@@ -6,7 +6,7 @@
 --
 -- Created by Rio Manson-Hay (@EmeraldSlash)
 --
--- Version: 8 (2025-10-21)
+-- Version: 9 (2025-10-23)
 --
 -- Change Log:
 --
@@ -40,6 +40,11 @@
 -- Version 8:
 -- >> Fixed .ServerInit() not properly tracking players who are already in the
 -- server at the time it was called.
+--
+-- Version 9: !!BREAKING!!
+-- >> Added support for server-initiated asset streaming ("mandating").
+-- >> Client-side asset streaming functions now take a streaming initiator
+-- (server or client) as the first argument.
 
 --------------------------------------------------------------------------------
 
@@ -47,6 +52,7 @@
 -- HELPER API:
 -- These are generic helpers for everyone using the module.
 --
+-- .Id(): string
 -- .IdFromStrings(): string
 -- .StringsFromId(): {string}
 
@@ -56,19 +62,44 @@
 -- HIGH-LEVEL API (HAPI):
 -- This is an easy API for developers who don't need much control.
 --
+-- Shared:
+--
+-- type Initiator = "server" | "client"
+--
 -- Server:
 --
--- type GetAssetCallback
--- Module.ServerInit(GetAssetCallback)
+-- type GetAssetCallback = (
+--		Player: Player,
+--		AssetId: string,
+--		Mode: Initiator
+-- )->(
+--		Instance?, -- AssetInstance
+--		boolean?, -- DestroyAssetInstanceAfterSend,
+--		number? -- CustomDescendantCount
+-- )
+--
+-- .ServerInit(GetAssetCallback)
+--
+-- type Mandate
+-- .ServerMandate(Player, AssetId): Mandate
+-- :Release/Destroy(): Mandate
+-- :Resend(): Mandate
+--
+-- .ServerMandateKey(Player, AssetId, Key): Mandate
+-- .ServerReleaseKey(Player, AssetId, Key)
+--
+-- .ServerResendMandated(Player, AssetId)
+-- .ServerReleaseMandates(Player)
 --
 -- Client:
 --
--- Module.ClientInit(): StreamerClient
--- Module.ClientUse(): Instance?        (immediate-mode)
--- Module.ClientSubscribe(): ClientSub  (retained-mode)
--- Module.ClientSetLogFunction(LogFunction)
+-- .ClientInit(): StreamerClient
+--
+-- .ClientUse(Initiator, Id): Instance?        (immediate-mode)
+-- .ClientSubscribe(Initiator, Id): ClientSub  (retained-mode)
 --
 -- type LogFunction = (String: string)->()
+-- .ClientSetLogFunction(LogFunction)
 --
 -- type ClientSub
 -- ClientSub:Unsubscribe/Destroy(): ClientSub
@@ -96,38 +127,39 @@
 -- .RequestId: enum
 -- type AssetRequest
 -- type AssetResponse
+-- type Initiator = "server" | "client"
 --
 -- Server:
 --
--- .MakeAssetResponse(): AssetResponse
+-- .MakeAssetResponse(Id, Asset, DescendantCount): AssetResponse
 --
 -- type Replicator
--- .CreateReplicator(): Replicator
+-- .CreateReplicator(Player): Replicator
 --
 -- type AssetSender
 -- .AS_Create(): AssetSender
--- .AS_Send()
--- .AS_Finish()
+-- .AS_Send(AssetSender, Parent, Asset, DestroyAfterSend)
+-- .AS_Finish(AssetSender)
 --
 -- Client:
 --
 -- type AssetHandle
 -- type AssetIncomplete
 -- type AssetLoadedCallback
--- .AH_AddCallback()
--- .AH_RemoveCallback()
--- .AH_AddThread()
--- .AH_RemoveThread()
--- .AH_YieldUntilReady()
+-- .AH_AddCallback(Handle, Callback)
+-- .AH_RemoveCallback(Handle, Callback)
+-- .AH_AddThread(Handle, Thread)
+-- .AH_RemoveThread(Handle, Thread)
+-- .AH_YieldUntilReady(Handle)
 --
--- type StreamerClient
+-- type StreamerClient (AKA SC)
 -- .SC_Create(): StreamerClient
--- .SC_ReceiveAssets()
--- .SC_CheckAssets()
--- .SC_CleanupAssets()
--- .SC_Use(): Instance?             (immediate-mode)
--- .SC_Subscribe(): AssetHandle     (retained-mode)
--- .SC_Unsubscribe()                (retained-mode)
+-- .SC_ReceiveAssets(SC, Assets, Now)
+-- .SC_CheckAssets(SC)
+-- .SC_CleanupAssets(SC, Now)
+-- .SC_Use(SC, Initiator, Id): Instance?              (immediate-mode)
+-- .SC_Subscribe(SC, Initiator, Id, Key): AssetHandle (retained-mode)
+-- .SC_Unsubscribe(SC, Id, Key, Now)                  (retained-mode)
 
 --------------------------------------------------------------------------------
 
@@ -135,6 +167,14 @@ local Module = {}
 
 -- Enable/disable microprofiler labels.
 local PRF_ON = false
+
+export type Initiator =
+	-- If the asset is not loaded, the client will just wait for the server to
+	-- send the asset, and will not send any requests.
+	| "server"
+	-- If the asset is not loaded, the client will send a request to the server
+	-- asking the server to send the asset.
+	| "client"
 
 --
 -- Internal utilities
@@ -239,6 +279,9 @@ end
 -- HELPER API
 --
 
+function Module.Id(...: string): string
+	return table.concat({...}, ";")
+end
 function Module.IdFromStrings(Strings: {string})
 	return table.concat(Strings, ";")
 end
@@ -262,11 +305,19 @@ Module.RequestId = {
 }
 export type AssetRequest = {string} -- {RequestId, AssetId}
 
-export type AssetResponse = {
-	Id: string;
-	Asset: Instance;
-	DescCount: number;
-}
+export type AssetResponse =
+	| {
+		Ki:
+			| "s" -- asset being sent in response to a client request
+			| "m"; -- asset being sent due to a server mandate
+		Id: string;
+		Asset: Instance;
+		DescCount: number;
+	}
+	| {
+		Ki: "r"; -- server released its mandate for an asset
+		Id: string;
+	}
 
 --
 -- LAPI Server
@@ -282,20 +333,14 @@ export type AssetResponse = {
 
 -- (Step 2) A RemoteEvent should be fired to the client while the instance is
 -- parented under their PlayerGui. This function .MakeAssetResponse() can be
--- used to get the data that should be sent to the client through that
--- RemoteEvent. You can send AssetResponses in bulk with a single firing of the
--- RemoteEvent, provided all of the asset instances are still parented under
--- PlayerGui at the time it is fired.
-function Module.MakeAssetResponse(
-	Id: string,
-	Asset: Instance,
-	DescendantCount: number?
-): AssetResponse
-	return {
-		Id = Id;
-		Asset = Asset;
-		DescCount = DescendantCount or #Asset:GetDescendants();
-	}
+-- used as a helper for typechecking the data that should be sent to the client
+-- through that RemoteEvent. You can send AssetResponses in bulk with a single
+-- firing of the RemoteEvent, provided all of the asset instances are still
+-- parented under PlayerGui at the time it is fired. If an instance is going be
+-- destroyed after it is sent then you should destroy it on the next heartbeat,
+-- otherwise its descendants will fail to replicate.
+function Module.MakeAssetResponse(Response: AssetResponse): AssetResponse
+	return Response
 end
 
 -- (Step 1) Replicator is just a quick way of creating a dedicated replication
@@ -320,10 +365,12 @@ end
 -- end, then forget the AssetSender.
 export type AssetSender = {
 	Parent_ByAsset: {[Instance]: {Instance?}};
+	Destroy_ByAsset: {[Instance]: boolean};
 }
 function Module.AS_Create(): AssetSender
 	return {
 		Parent_ByAsset = {};
+		Destroy_ByAsset = {};
 	}
 end
 function Module.AS_Send(
@@ -333,16 +380,26 @@ function Module.AS_Send(
 	-- should pass PlayerGui or a descendant of it.
 	Parent: Instance,
 
-	Asset: Instance
+	Asset: Instance,
+
+	DestroyAfterSend: boolean?
 )
 	if PRF_ON then debug.profilebegin("Instreamer_AS_Send") end
 
-	if not AS.Parent_ByAsset[Asset] then
+	if DestroyAfterSend then
+		AS.Destroy_ByAsset[Asset] = true
+		AS.Parent_ByAsset[Asset] = nil
+	end
+
+	if not AS.Destroy_ByAsset[Asset] and
+		not AS.Parent_ByAsset[Asset]
+	then
 		-- An asset's original parent may be nil, so we need to wrap each parent
 		-- in an array to guarantee that the asset is stored in the hash table no
 		-- matter what it's original parent was.
 		AS.Parent_ByAsset[Asset] = {Asset.Parent}
 	end
+
 	Asset.Parent = Parent
 
 	if PRF_ON then debug.profileend() end
@@ -350,9 +407,21 @@ end
 function Module.AS_Finish(AS: AssetSender)
 	if PRF_ON then debug.profilebegin("Instreamer_AS_Finish") end
 
+	for Asset in AS.Destroy_ByAsset do
+		-- Destroying needs to be deferred until the asset and its descendants are
+		-- actually sent to the client after heartbeat. To guarantee this happens
+		-- no matter where AS_Finish is called from, we need to wait twice.
+		task.spawn(function()
+			task.wait()
+			task.wait()
+			Asset:Destroy()
+		end)
+	end
 	for Asset, Wrapper in AS.Parent_ByAsset do
 		Asset.Parent = Wrapper[1]
 	end
+	table.clear(AS.Destroy_ByAsset)
+	table.clear(AS.Parent_ByAsset)
 
 	if PRF_ON then debug.profileend() end
 end
@@ -389,9 +458,10 @@ export type AssetHandle = {
 	--
 
 	-- These are markers to indicate who is currently using the asset.
-	Immediate: boolean?;
+	Mandated: boolean?; -- Server is using this.
+	Immediate: boolean?; -- Immediate-mode API is using this.
 	-- @Cleanup Using an array for this may be slow but it'll do for now.
-	Retained: {any}?;
+	Retained: {any}?; -- Retained-mode API is using this.
 
 	-- The timestamp when the asset should be unsubscribed and destroyed, used
 	-- only while the asset is unused and in the StreamerClient.DLL_Cache.
@@ -497,49 +567,103 @@ function Module.SC_Create(CacheExpiry: number?): StreamerClient
 	return SC
 end
 
+local function ProvideAsset(
+	SC: StreamerClient,
+	Handle: AssetHandle,
+	Asset: Instance,
+	DescCount: number
+)
+	-- @Cleanup Parenting the asset to nil may prevent the instance from
+	-- fully replicating if it is recieved partially replicated. However,
+	-- according to my tests, this replication is always atomic. So I guess
+	-- we don't need to worry about that. This means all the
+	-- AssetIncomplete stuff is unnecessary and we can delete that. But for
+	-- the time being I will keep that stuff in order to confirm if assets
+	-- will ever fail to replicate fully.
+
+	Asset.Parent = nil
+
+	AH_DestroyIncomplete(Handle)
+
+	if SC.LogFunction then
+		SC.LogFunction(("rec \"%s\""):format(Handle.Id))
+	end
+
+	local Incomplete = {} :: DLL_Node<AssetIncomplete>
+	Incomplete.Handle = Handle
+	Incomplete.Asset = Asset
+	Incomplete.Count = DescCount
+	Incomplete.Connection = Asset.DescendantAdded:Connect(function()
+		if (Handle.Incomplete == Incomplete) and
+			(not DLL_IsInside(SC.DLL_CheckAsset, Incomplete))
+		then
+			DLL_Remove(Incomplete)
+			DLL_Append(SC.DLL_CheckAsset, Incomplete)
+		end
+	end)
+	Handle.Incomplete = Incomplete
+	DLL_Append(SC.DLL_CheckAsset, Incomplete)
+end
+
+local function ReturnHandleToCache(
+	SC: StreamerClient,
+	Handle: DLL_Node<AssetHandle>,
+	Now: number
+)
+	if not Handle.Immediate and
+		not Handle.Retained and
+		not Handle.Mandated
+	then
+		Handle.ExpireAt = Now + SC.CacheExpiry
+		DLL_Remove(Handle) -- Shouldn't be necessary, but let's be safe.
+		DLL_Append(SC.DLL_Cache, Handle)
+	end
+end
+
 -- Call this in the remote event listeners which recieve assets and start
 -- tracking them.
-function Module.SC_ReceiveAssets(SC: StreamerClient, Assets: {AssetResponse})
+function Module.SC_ReceiveAssets(SC: StreamerClient, Assets: {AssetResponse}, Now: number)
 	if PRF_ON then debug.profilebegin("Instreamer_SC_ReceiveAssets") end
 
 	for _, Response in Assets do
-		local Handle = SC.Handle_ById[Response.Id]
-		local Asset = Response.Asset
-		if not Handle then
-			Asset:Destroy()
 
-		elseif Asset then
-
-			-- @Cleanup Parenting the asset to nil may prevent the instance from
-			-- fully replicating if it is recieved partially replicated. However,
-			-- according to my tests, this replication is always atomic. So I guess
-			-- we don't need to worry about that. This means all the
-			-- AssetIncomplete stuff is unnecessary and we can delete that. But for
-			-- the time being I will keep that stuff in order to confirm if assets
-			-- will ever fail to replicate fully.
-
-			Asset.Parent = nil
-
-			AH_DestroyIncomplete(Handle)
-
-			if SC.LogFunction then
-				SC.LogFunction(("rec \"%s\""):format(Response.Id))
+		if Response.Ki == "s" then
+			if Response.Asset then
+				local Handle = SC.Handle_ById[Response.Id]
+				if not Handle then
+					Response.Asset:Destroy()
+				else
+					ProvideAsset(SC, Handle, Response.Asset, Response.DescCount)
+				end
 			end
 
-			local Incomplete = {} :: DLL_Node<AssetIncomplete>
-			Incomplete.Handle = Handle
-			Incomplete.Asset = Asset
-			Incomplete.Count = Response.DescCount
-			Incomplete.Connection = Asset.DescendantAdded:Connect(function()
-				if (Handle.Incomplete == Incomplete) and
-					(not DLL_IsInside(SC.DLL_CheckAsset, Incomplete))
-				then
-					DLL_Remove(Incomplete)
-					DLL_Append(SC.DLL_CheckAsset, Incomplete)
+		elseif Response.Ki == "m" then
+			if Response.Asset then
+				if not SC.Handle_ById[Response.Id] then
+					local Handle = {} :: DLL_Node<AssetHandle>
+					SC.Handle_ById[Response.Id] = Handle
+					Handle.Id = Response.Id
+					Handle.ExpireAt = -math.huge
+					if SC.LogFunction then
+						SC.LogFunction(("sub \"%s\""):format(Handle.Id))
+					end
 				end
-			end)
-			Handle.Incomplete = Incomplete
-			DLL_Append(SC.DLL_CheckAsset, Incomplete)
+				local Handle = SC.Handle_ById[Response.Id]
+				Handle.Mandated = true
+				-- @RemoveFromCache
+				if DLL_IsInside(SC.DLL_Cache, Handle) then
+					DLL_Remove(Handle)
+				end
+				ProvideAsset(SC, Handle, Response.Asset, Response.DescCount)
+			end
+
+		elseif Response.Ki == "r" then
+
+			local Handle = SC.Handle_ById[Response.Id]
+			if Handle and Handle.Mandated then
+				Handle.Mandated = nil
+				ReturnHandleToCache(SC, Handle, Now)
+			end
 		end
 	end
 
@@ -562,20 +686,30 @@ function Module.SC_CheckAssets(SC: StreamerClient)
 		local Count = #Incomplete.Asset:GetDescendants()
 		if Count < Incomplete.Count then
 
-			-- @IncompleteAsset I believe that replication of instance through
-			-- PlayerGui is atomic. Moreover, this module has not been fully tested
-			-- in non-atomic circumstances because they could not be produced.
+			-- @IncompleteAsset If you have assets that are being identified as
+			-- incomplete, read this:
 			--
-			-- So it is likely that incomplete is more of a permanent issue, caused
-			-- by some descendants existing on the server that were not replicated
-			-- to the client, or by descendants that were deleted by other parts of
-			-- the game's client-side codebase.
+			-- I believe that replication of instances through PlayerGui is atomic.
+			-- When trying to test this, I could not produce any circumstance
+			-- where replication was non-atomic. So it's likely that non-atomic
+			-- replication is not the issue here, and therefore whatever issue is
+			-- occurring is probably on your end. (But if it isn't, please let me
+			-- know!)
 			--
-			-- If you cannot avoid that server/client difference, then on the
-			-- server you should pass a custom DescendantCount into
-			-- .MakeAssetResponse(), so that the differences between client and
-			-- server are accounted for and the server tells the client to expect
-			-- the correct number of descendants.
+			-- So any incompleteness in your assets is probably caused by some
+			-- descendants existing on the server that were not replicated to the
+			-- client, or by descendants that were deleted by other parts of the
+			-- game's client-side codebase before Instreamer saw it (e.g. via
+			-- CollectionService tag callbacks).
+			--
+			-- If you cannot avoid that server/client desync, then on the server
+			-- you could pass a custom DescendantCount into .MakeAssetResponse()
+			-- (or as an additional return value of GetAssetCallback), so that the
+			-- differences between client and server are accounted for and the
+			-- server tells the client to expect the correct number of descendants.
+			--
+			-- Alternatively, if you want to disable this warning entirely, you can
+			-- just use 0 as the descendant count.
 
 			warn(("[Instreamer] Asset '%s' was recieved with only %d / %d descendants. Is there a difference in its descendants between server and client? See @IncompleteAsset for more info.")
 				:format(Incomplete.Handle.Id, Count, Incomplete.Count))
@@ -652,11 +786,7 @@ function Module.SC_CleanupAssets(SC: StreamerClient, Now: number)
 
 		DLL_Remove(Handle)
 		Handle.Immediate = nil
-
-		if not Handle.Retained then
-			Handle.ExpireAt = Now + SC.CacheExpiry
-			DLL_Append(SC.DLL_Cache, Handle)
-		end
+		ReturnHandleToCache(SC, Handle, Now)
 	end
 
 	-- Swap used and unused for the next frame.
@@ -675,7 +805,7 @@ end
 
 -- Immediate-mode API. Call this when you want to implicitly subscribe to
 -- an asset at the same time as trying to retrieve it.
-function Module.SC_Use(SC: StreamerClient, Id: string): Instance?
+function Module.SC_Use(SC: StreamerClient, Initiator: Initiator, Id: string): Instance?
 	if PRF_ON then debug.profilebegin("Instreamer_SC_Use") end
 
 	if not SC.Handle_ById[Id] then
@@ -683,9 +813,10 @@ function Module.SC_Use(SC: StreamerClient, Id: string): Instance?
 		SC.Handle_ById[Id] = Handle
 		Handle.Id = Id
 		Handle.ExpireAt = -math.huge
-		SC.PendingRequests[#SC.PendingRequests+1] =
-			{Module.RequestId.subscribe; Handle.Id}
-
+		if Initiator == "client" then
+			SC.PendingRequests[#SC.PendingRequests+1] =
+				{Module.RequestId.subscribe; Handle.Id}
+		end
 		if SC.LogFunction then
 			SC.LogFunction(("sub \"%s\""):format(Handle.Id))
 		end
@@ -693,6 +824,7 @@ function Module.SC_Use(SC: StreamerClient, Id: string): Instance?
 
 	local Handle = SC.Handle_ById[Id]
 	Handle.Immediate = true
+	-- @RemoveFromCache
 	if not DLL_IsInside(SC.DLL_Used, Handle) then
 		DLL_Remove(Handle)
 		DLL_Append(SC.DLL_Used, Handle)
@@ -707,7 +839,7 @@ end
 -- well as the asset ID, you must provide a key which is used to identify the
 -- particular code or game system that wants to use the asset, so different game
 -- systems can all use the same asset without knowing about each other.
-function Module.SC_Subscribe(SC: StreamerClient, Id: string, Key: any): AssetHandle
+function Module.SC_Subscribe(SC: StreamerClient, Initiator: Initiator, Id: string, Key: any): AssetHandle
 	if PRF_ON then debug.profilebegin("Instreamer_SC_Subscribe") end
 
 	assert(Key ~= nil, "[Instreamer] Cannot subscribe to an asset without a key.")
@@ -717,9 +849,10 @@ function Module.SC_Subscribe(SC: StreamerClient, Id: string, Key: any): AssetHan
 		SC.Handle_ById[Id] = Handle
 		Handle.Id = Id
 		Handle.ExpireAt = -math.huge
-		SC.PendingRequests[#SC.PendingRequests+1] =
-			{Module.RequestId.subscribe; Handle.Id}
-
+		if Initiator == "client" then
+			SC.PendingRequests[#SC.PendingRequests+1] =
+				{Module.RequestId.subscribe; Handle.Id}
+		end
 		if SC.LogFunction then
 			SC.LogFunction(("sub \"%s\""):format(Handle.Id))
 		end
@@ -734,6 +867,7 @@ function Module.SC_Subscribe(SC: StreamerClient, Id: string, Key: any): AssetHan
 	else
 		Handle.Retained[#Handle.Retained+1] = Key
 	end
+	-- @RemoveFromCache
 	if DLL_IsInside(SC.DLL_Cache, Handle) then
 		DLL_Remove(Handle)
 	end
@@ -758,12 +892,7 @@ function Module.SC_Unsubscribe(SC: StreamerClient, Id: string, Key: any, Now: nu
 				table.remove(Retained, Index)
 				if not Retained[1] then
 					Handle.Retained = nil
-
-					if not Handle.Immediate then
-						Handle.ExpireAt = Now + SC.CacheExpiry
-						DLL_Remove(Handle) -- Shouldn't be necessary, but let's be safe.
-						DLL_Append(SC.DLL_Cache, Handle)
-					end
+					ReturnHandleToCache(SC, Handle, Now)
 				end
 			end
 		end
@@ -784,19 +913,69 @@ end
 
 local RunService = game:GetService("RunService")
 
-export type GetAssetCallback = (Player: Player, AssetId: string)->(Instance?)
+-- The callback must not yield!!!
+export type GetAssetCallback = (
+	Player: Player, -- Player who the asset would be sent to.
+	AssetId: string, -- Unique identifier for the asset.
+	Mode: Initiator -- Whether the server or client wants to stream the asset.
+)->(
+	Instance?, -- AssetInstance
+	boolean?, -- DestroyAssetInstanceAfterSend,
+	number? -- CustomDescendantCount
+)
+
+export type Mandate = {
+	--
+	-- EXPOSED API
+	--
+
+	-- Indicates whether the mandate is still active or not.
+	Active: boolean;
+
+	-- Make the asset be resent to the client. NOTE: If the mandate is released
+	-- before the resend has occurred, the resend will still happen if other
+	-- mandates are still active for the asset.
+	Resend: (Mandate)->();
+
+	-- These methods are identical. Call them to clean up the mandate and stop
+	-- the server from replicating the asset to the client.
+	Release: (Mandate)->();
+	Destroy: (Mandate)->();
+
+	--
+	-- INTERNAL API
+	--
+
+	MA: MandatedAsset;
+	Key: any?;
+}
+
+-- These types are for internal use only.
+type MandatedAsset = {
+	AssetId: string;
+	Sent: boolean;
+	PS: PlayerState?;
+
+	Mandates: {Mandate};
+	Mandate_ByKey: {[any]: Mandate};
+
+	Release: (MandatedAsset)->();
+}
+type PlayerState = {
+	Replicator: Replicator;
+	PendingMAs: {MandatedAsset};
+	PendingAssetRequests: {AssetRequest};
+	Subscribed_ByAssetId: {[string]: boolean};
+	ClientReady: boolean;
+}
 
 do
-	type PlayerState = {
-		Replicator: Replicator;
-		PendingAssetRequests: {AssetRequest};
-		Subscribed_ByAssetId: {[string]: boolean};
-	}
 
 	local State = (function() return { -- Function to seal table type.
 
 		Initialized = false;
 		PS_ByPlayer = {} :: {[Player]: PlayerState};
+		MA_ByAssetId_ByPlayer = {} :: {[Player]: {[string]: MandatedAsset}}
 
 	} end)()
 
@@ -809,9 +988,12 @@ do
 	-- player. For example, the callback could look up the asset in a table, and
 	-- check whether the player is allowed to receive the asset. The callback
 	-- should return nil if an asset does not exist or the player is not allowed
-	-- to receive it.
+	-- to receive it. The callback must not yield!!!!
 	--
-	function Module.ServerInit(GetAssetCallback: GetAssetCallback)
+	function Module.ServerInit(
+		GetAssetCallback: GetAssetCallback,
+		ReleaseMandatesManuallyOnLeave: boolean?
+	)
 		if not State.Initialized then
 			State.Initialized = true
 
@@ -820,15 +1002,40 @@ do
 				local PS = State.PS_ByPlayer[Player]
 				if PS then
 					State.PS_ByPlayer[Player] = nil
+					Player:SetAttribute("__Instreamer_PlayerLeft", true)
 					PS.Replicator:Destroy()
+
+					-- Clear out references to the player state and to pending MAs.
+					table.clear(PS.PendingMAs)
+					local MA_ByAssetId = State.MA_ByAssetId_ByPlayer[Player]
+					if MA_ByAssetId then
+						for _, MA in MA_ByAssetId do
+							MA.PS = nil
+						end
+					end
+
+					-- Release mandates for that player.
+					if not ReleaseMandatesManuallyOnLeave then
+						Module.ServerReleaseMandates(Player)
+					end
 				end
 			end)
 			local function PlayerAdded(Player: Player)
 				local PS = {} :: PlayerState
 				PS.Replicator = Module.CreateReplicator(Player)
+				PS.PendingMAs = {}
 				PS.PendingAssetRequests = {}
 				PS.Subscribed_ByAssetId = {}
 				State.PS_ByPlayer[Player] = PS
+
+				-- Add references to the player state and to pending MAs.
+				local MA_ByAssetId = State.MA_ByAssetId_ByPlayer[Player]
+				if MA_ByAssetId then
+					for _, MA in MA_ByAssetId do
+						MA.PS = PS
+						PS.PendingMAs[#PS.PendingMAs+1] = MA
+					end
+				end
 			end
 			Players.PlayerAdded:Connect(PlayerAdded)
 			for _, Player in Players:GetPlayers() do
@@ -844,6 +1051,7 @@ do
 			)
 				local PS = State.PS_ByPlayer[Player]
 				if PS then
+					PS.ClientReady = true
 					for _, Request in Requests do
 						PS.PendingAssetRequests[#PS.PendingAssetRequests+1] = Request
 					end
@@ -856,52 +1064,237 @@ do
 				local AssetSender = Module.AS_Create()
 
 				for Player, PS in State.PS_ByPlayer do
+					if PS.ClientReady then
 
-					-- Process all requests in a first pass to avoid duplication of
-					-- asset getter & replication work.
-					local Subscribed_ByAssetId = {}
-					for _, Request in PS.PendingAssetRequests do
-						local AssetId = Request[2]
-						if type(AssetId) == "string" then
-							local RequestId = Request[1]
-							if RequestId == Module.RequestId.unsubscribe then
-								Subscribed_ByAssetId[AssetId] = false
-							elseif RequestId == Module.RequestId.subscribe then
-								Subscribed_ByAssetId[AssetId] = true
+						-- Process all requests in a first pass to avoid duplication of
+						-- asset getter & replication work.
+						local Subscribed_ByAssetId: {[string]: MandatedAsset | "client"} = {}
+						for _, Request in PS.PendingAssetRequests do
+							local AssetId = Request[2]
+							if type(AssetId) == "string" then
+								local RequestId = Request[1]
+								if RequestId == Module.RequestId.unsubscribe then
+									Subscribed_ByAssetId[AssetId] = nil
+								elseif RequestId == Module.RequestId.subscribe then
+									Subscribed_ByAssetId[AssetId] = "client"
+								end
 							end
 						end
-					end
-					table.clear(PS.PendingAssetRequests)
+						table.clear(PS.PendingAssetRequests)
 
-					-- Second pass to apply the subscription state changes and
-					-- replicate assets.
-					local SentAssets = {}
-					for AssetId, NewSubscribed in Subscribed_ByAssetId do
-						if not NewSubscribed then
-							PS.Subscribed_ByAssetId[AssetId] = nil
+						-- Add the pending mandated assets to the list as well. Do
+						-- them after the request work, so that they don't get
+						-- overwritten.
+						for _, PendingMA in PS.PendingMAs do
+							Subscribed_ByAssetId[PendingMA.AssetId] = PendingMA
+						end
+						table.clear(PS.PendingMAs)
 
-						elseif not PS.Subscribed_ByAssetId[AssetId] then
-							local AssetInstance = GetAssetCallback(Player, AssetId)
-							if not AssetInstance then
+						-- Do the second pass to apply the subscription state changes
+						-- and replicate assets.
+						local SentAssets = {}
+						for AssetId, NewSubscribed in Subscribed_ByAssetId do
+							if not NewSubscribed then
 								PS.Subscribed_ByAssetId[AssetId] = nil
-							else
-								PS.Subscribed_ByAssetId[AssetId] = true
 
-								Module.AS_Send(AssetSender, PS.Replicator, AssetInstance)
-								SentAssets[#SentAssets+1] =
-									Module.MakeAssetResponse(AssetId, AssetInstance)
+							elseif not PS.Subscribed_ByAssetId[AssetId] then
+
+								local AssetInstance, DestroyAfterSend, DescendantCount =
+									GetAssetCallback(
+										Player,
+										AssetId,
+										if type(NewSubscribed) == "table" then "server" else "client")
+								if not AssetInstance then
+									PS.Subscribed_ByAssetId[AssetId] = nil
+
+								else
+									Module.AS_Send(
+										AssetSender, PS.Replicator, AssetInstance, DestroyAfterSend)
+									SentAssets[#SentAssets+1] = Module.MakeAssetResponse({
+										Ki = if type(NewSubscribed) == "table" then "m" else "s";
+										Id = AssetId;
+										Asset = AssetInstance;
+										DescCount = DescendantCount or #AssetInstance:GetDescendants();
+									})
+
+									if type(NewSubscribed) == "table" then
+										local MA = NewSubscribed :: MandatedAsset
+										MA.Sent = true
+										if not MA.Mandates[1] then
+											MA:Release()
+										end
+									end
+								end
 							end
 						end
-					end
-					if SentAssets[1] then
-						RemoteEvent:FireClient(Player, SentAssets)
+						if SentAssets[1] then
+							RemoteEvent:FireClient(Player, SentAssets)
+						end
+
 					end
 				end
-
 				Module.AS_Finish(AssetSender)
 
 				if PRF_ON then debug.profileend() end
 			end)
+		end
+	end
+
+	local MAMeta: MandatedAsset =
+		(function() local Class = {}; Class.__index = Class; return Class end)() :: any
+	function MAMeta.Release(MA: MandatedAsset)
+		for _, Mandate in MA.Mandates do
+			Mandate.Active = false
+		end
+		table.clear(MA.Mandates)
+		local PS = MA.PS
+		if PS then
+			MA.PS = nil
+			local Index = table.find(PS.PendingMAs, MA)
+			if Index then
+				table.remove(PS.PendingMAs, Index)
+			end
+		end
+	end
+
+	local MandateMeta: Mandate =
+		(function() local Class = {}; Class.__index = Class; return Class end)() :: any
+	function MandateMeta.Release(Mandate: Mandate)
+		Mandate.Active = false
+		local MA = Mandate.MA
+		local Index = table.find(MA.Mandates, Mandate)
+		if Index then
+			table.remove(MA.Mandates, Index)
+		end
+		if Mandate.Key then
+			if MA.Mandate_ByKey then
+				MA.Mandate_ByKey[Mandate.Key] = nil
+			end
+			Mandate.Key = nil -- Allow GC of key.
+		end
+		if not MA.Mandates[1] then
+			MA:Release()
+		end
+	end
+	MandateMeta.Destroy = MandateMeta.Release
+
+	function MandateMeta.Resend(Mandate: Mandate)
+		local MA = Mandate.MA
+		local PS = MA.PS
+		if PS then
+			if not table.find(PS.PendingMAs, MA) then
+				PS.PendingMAs[#PS.PendingMAs+1] = MA
+			end
+		end
+	end
+
+	function Module.ServerResendMandated(Player: Player, AssetId: string)
+		local MA_ByAssetId = State.MA_ByAssetId_ByPlayer[Player]
+		if MA_ByAssetId then
+			local MA = MA_ByAssetId[AssetId]
+			if MA then
+				local PS = MA.PS
+				if PS then
+					if not table.find(PS.PendingMAs, MA) then
+						PS.PendingMAs[#PS.PendingMAs+1] = MA
+					end
+				end
+			end
+		end
+	end
+	function Module.ServerReleaseMandates(Player: Player)
+		local PS = State.PS_ByPlayer[Player]
+		if PS then
+			table.clear(PS.PendingMAs)
+		end
+		local MA_ByAssetId = State.MA_ByAssetId_ByPlayer[Player]
+		if MA_ByAssetId then
+			State.MA_ByAssetId_ByPlayer[Player] = nil
+			for _, MA in MA_ByAssetId do
+				MA:Release()
+			end
+		end
+	end
+
+	local function CreateMA(Player: Player, AssetId: string): MandatedAsset
+		if not State.MA_ByAssetId_ByPlayer[Player] then
+			State.MA_ByAssetId_ByPlayer[Player] = {}
+		end
+		local MA_ByAssetId = State.MA_ByAssetId_ByPlayer[Player]
+
+		if not MA_ByAssetId[AssetId] then
+			local MA: MandatedAsset = setmetatable({}, MAMeta) :: any
+			MA_ByAssetId[AssetId] = MA
+			MA.AssetId = AssetId
+			MA.Sent = false
+			MA.Mandates = {}
+			MA.Mandate_ByKey = {}
+
+			local PS = State.PS_ByPlayer[Player]
+			if PS then
+				MA.PS = PS
+				PS.PendingMAs[#PS.PendingMAs+1] = MA
+			end
+		end
+
+		return MA_ByAssetId[AssetId]
+	end
+	local DummyMA: MandatedAsset = setmetatable({
+		AssetId = "__Instreamer_DummyAsset";
+		Sent = false;
+		Mandates = {};
+		Mandate_ByKey = {};
+	}, MAMeta) :: any
+	table.freeze(DummyMA)
+
+	-- If a function that would create & return a Mandate is called after a
+	-- player has left the game, then a dummy mandate will be returned instead.
+	-- Most things you would do with the mandate would still be valid, unless
+	-- you directly require Mandate.Active to be true, or Mandate.MA to be
+	-- modifiable.
+
+	function Module.ServerMandate(Player: Player, AssetId: string): Mandate
+		if Player:GetAttribute("__Instreamer_PlayerLeft") then
+			local Mandate: Mandate = setmetatable({}, MandateMeta) :: any
+			Mandate.MA = DummyMA
+			Mandate.Active = false
+			return Mandate
+		else
+			local MA = CreateMA(Player, AssetId)
+			local Mandate: Mandate = setmetatable({}, MandateMeta) :: any
+			MA.Mandates[#MA.Mandates+1] = Mandate
+			Mandate.MA = MA
+			Mandate.Active = true
+			return Mandate
+		end
+	end
+
+	function Module.ServerMandateKey(Player: Player, AssetId: string, Key: any): Mandate
+		if Player:GetAttribute("__Instreamer_PlayerLeft") then
+			local Mandate: Mandate = setmetatable({}, MandateMeta) :: any
+			Mandate.MA = DummyMA
+			Mandate.Active = false
+			return Mandate
+		else
+			local MA = CreateMA(Player, AssetId)
+			if not MA.Mandate_ByKey[Key] then
+				local Mandate = Module.ServerMandate(Player, AssetId)
+				MA.Mandate_ByKey[Key] = Mandate
+				Mandate.Key = Key
+			end
+			return MA.Mandate_ByKey[Key]
+		end
+	end
+	function Module.ServerReleaseKey(Player: Player, AssetId: string, Key: any)
+		local MA_ByAssetId = State.MA_ByAssetId_ByPlayer[Player]
+		if MA_ByAssetId then
+			local MA = MA_ByAssetId[AssetId]
+			if MA then
+				local Mandate = MA.Mandate_ByKey[Key]
+				if Mandate then
+					Mandate:Release()
+				end
+			end
 		end
 	end
 end
@@ -982,11 +1375,12 @@ do
 				RunService.Heartbeat:Connect(function()
 					if PRF_ON then debug.profilebegin("Instreamer_ClientHbt") end
 
-					Module.SC_ReceiveAssets(State.SC, State.PendingResponses)
+					local Now = os.clock()
+					Module.SC_ReceiveAssets(State.SC, State.PendingResponses, Now)
 					table.clear(State.PendingResponses)
 
 					Module.SC_CheckAssets(State.SC)
-					Module.SC_CleanupAssets(State.SC, os.clock())
+					Module.SC_CleanupAssets(State.SC, Now)
 
 					local Requests = State.SC.PendingRequests
 					if Requests[1] then
@@ -996,6 +1390,10 @@ do
 
 					if PRF_ON then debug.profileend() end
 				end)
+
+				-- Send an empty request to tell the server that the client is
+				-- ready.
+				RemoteEvent:FireServer({})
 			end)
 		end
 	end
@@ -1179,11 +1577,15 @@ do
 	-- You can optionally provide a StreamerClient that you created manually if
 	-- you want to use this HAPI function on it.
 	--
-	function Module.ClientUse(Id: string, SC: StreamerClient?): Instance?
+	function Module.ClientUse(
+		Initiator: Initiator,
+		Id: string,
+		SC: StreamerClient?
+	): Instance?
 		RequireClient()
 		if not SC then ClientInitInternal() end
 
-		return Module.SC_Use(SC or State.SC, Id)
+		return Module.SC_Use(SC or State.SC, Initiator, Id)
 	end
 
 	-- Module.ClientSubscribe()
@@ -1198,7 +1600,12 @@ do
 	-- You can optionally provide a StreamerClient that you created manually if
 	-- you want to use this HAPI function on it.
 	--
-	function Module.ClientSubscribe(Id: string, Key: any?, SC: StreamerClient?): ClientSub
+	function Module.ClientSubscribe(
+		Initiator: Initiator,
+		Id: string,
+		Key: any?,
+		SC: StreamerClient?
+	): ClientSub
 		RequireClient()
 		if not SC then ClientInitInternal() end
 
@@ -1217,7 +1624,7 @@ do
 
 		local RealKey = if Key ~= nil then Key else CS
 		CS.Key = RealKey
-		CS.Handle = Module.SC_Subscribe(SC or State.SC, Id, CS.Key)
+		CS.Handle = Module.SC_Subscribe(SC or State.SC, Initiator, Id, CS.Key)
 		
 		return CS
 	end
