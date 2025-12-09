@@ -11,9 +11,10 @@ At the moment, this library provides:
 - Lots of flexibility:
    - Assets are identified by strings, with an optional convention for namespacing different asset types
    - The server can respond with anything it likes to any player including generating instances on the fly
-   - High-level API for developers who just want plug & play asset streaming
-   - Low-level API for developers who want a bit more control over things like code execution
+   - High-level API ("HAPI") for developers who just want plug & play asset streaming
+   - Low-level API ("LAPI") for developers who want a bit more control over things like code execution
 
 Future plans:
+- Improve the APIs by making all top-level HAPI functions be methods on a StreamerClient. This should reduce unnecessary separation between HAPI and LAPI, and also improve the HAPI UX by more readily enabling a StreamerClient to be passed around in usage code rather than having to require the module unnecessarily. But I'm not sure whether to keep the top-level HAPI functions or require that all usage always index into a default Instreamer.StreamerClient field?
 - Confirm whether instances replicate atomically through PlayerGui or not. (They appear to be atomic in my experience so far.)
 - Maybe: Allowances for different expiry timings/conditions for cached assets client-side.
